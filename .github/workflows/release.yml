@@ -65,6 +65,18 @@ on:
         description: SPDX identifier of the license; empty when the repository has none yet
         type: string
         default: ""
+      sentry_org:
+        description: Sentry organization of sentry_project
+        type: string
+        default: ""
+      sentry_project:
+        description: Sentry project that releases upload their source maps to, with the SENTRY_AUTH_TOKEN secret; empty uploads nothing
+        type: string
+        default: ""
+    secrets:
+      SENTRY_AUTH_TOKEN:
+        description: Sentry organization token for the source maps of releases
+        required: false
 
 permissions:
   contents: read
@@ -77,6 +89,8 @@ env:
   TITLE: ${{ inputs.title }}
   DESCRIPTION: ${{ inputs.description }}
   LICENSE: ${{ inputs.license }}
+  SENTRY_ORG: ${{ inputs.sentry_org }}
+  SENTRY_PROJECT: ${{ inputs.sentry_project }}
   # The repository of this file. It signs the attestation of every image, so
   # the check of an image's origin names it (--signer-repo).
   SIGNER_REPO: meldgrove/.github
@@ -274,6 +288,8 @@ jobs:
           persist-credentials: false
 
       - name: Build
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: |
           # A BuildKit container: it can push an image by its digest alone.
           docker buildx create --use --driver docker-container > /dev/null
@@ -287,6 +303,17 @@ jobs:
             --label "org.opencontainers.image.created=$(git log -1 --format=%cI)")
           if [ -n "$TARGET" ]; then
             args+=(--target "$TARGET")
+          fi
+          # Only releases upload source maps. The build reads the token as a
+          # secret, so it stays out of the image and the build arguments; the
+          # Dockerfile uploads when the secret is there.
+          if [ "$PUBLISH" = true ] && [ -n "$SENTRY_PROJECT" ]; then
+            if [ -n "$SENTRY_AUTH_TOKEN" ]; then
+              args+=(--secret "id=sentry_auth_token,env=SENTRY_AUTH_TOKEN"
+                --build-arg "SENTRY_ORG=$SENTRY_ORG" --build-arg "SENTRY_PROJECT=$SENTRY_PROJECT")
+            else
+              echo "::warning::The SENTRY_AUTH_TOKEN secret is not set: this release's source maps are not uploaded to Sentry."
+            fi
           fi
           printf '%s\n' "${args[@]}" > "$RUNNER_TEMP/build-args"
           docker buildx build "${args[@]}" --output type=docker,name=release:test .
@@ -305,6 +332,7 @@ jobs:
         if: env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: |
           echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           mapfile -t args < "$RUNNER_TEMP/build-args"

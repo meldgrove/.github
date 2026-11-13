@@ -113,6 +113,14 @@ jobs:
 | `target` | Dockerfile stage to publish. Default: the last stage. |
 | `ci_workflow` | File name of the workflow that must have passed for the commit. Default `ci.yml`. |
 | `license` | SPDX identifier of the license. Empty while the repository has none. |
+| `sentry_org`, `sentry_project` | Sentry project that releases upload their source maps to. Empty uploads nothing. |
+
+With `sentry_project`, a release passes the caller's secret `SENTRY_AUTH_TOKEN`
+(`secrets: SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}` in the calling
+job) to the image build as the build secret `sentry_auth_token`, with the
+build arguments `SENTRY_ORG` and `SENTRY_PROJECT`; the Dockerfile uploads the
+source maps when the secret is there. Dry runs and pull requests upload
+nothing. A release without the secret warns and uploads nothing.
 
 The repository also needs `.github/release.yml` (sections of the release
 notes), the label `breaking`, a Dockerfile whose runtime stage takes
