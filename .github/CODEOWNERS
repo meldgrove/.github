@@ -1,0 +1,4 @@
+# Every Meldgrove repository releases with the workflow in this repository:
+# a pull request that changes anything here asks the maintainers team for
+# review.
+* @meldgrove/maintainers
