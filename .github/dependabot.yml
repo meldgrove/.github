@@ -1,0 +1,16 @@
+# Weekly updates of the actions that the release workflow pins. Security
+# updates ignore the schedule and the cooldown.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Let new releases settle before they are proposed.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: ["*"]
