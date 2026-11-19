@@ -17,6 +17,13 @@
 #
 # A dry run does everything except push and publish. Pull requests that change
 # the image build and start both platforms without publishing anything.
+#
+# A preview (preview: true, from a workflow_run of CI on main) publishes the
+# commit `revision` as X.Y.Z-preview.N: the next patch after the newest
+# release that the commit contains, N commits past it. It also moves the tag
+# `preview` when it is newer. No git tag, no GitHub Release, no `stable`, no
+# source maps. Installations on the Preview channel install it (Meldgrove
+# Updater).
 # Only GitHub-owned actions pinned by commit SHA (repository Actions settings):
 # Docker, uv and npm run through their command lines.
 
@@ -37,6 +44,14 @@ on:
         description: "Dry run: build, show the version and notes, publish nothing"
         type: boolean
         default: false
+      preview:
+        description: "Preview: publish the commit `revision` of main as X.Y.Z-preview.N and move the tag preview (no release)"
+        type: boolean
+        default: false
+      revision:
+        description: Full commit SHA on main that a preview publishes; CI must have passed for it
+        type: string
+        default: ""
       image:
         description: The image to publish, e.g. ghcr.io/meldgrove/logbuch
         type: string
@@ -109,6 +124,8 @@ jobs:
       contents: write # push the tag, preview the notes
       pull-requests: read # read the labels of the merged pull requests
     outputs:
+      preview: ${{ steps.version.outputs.preview }}
+      skip: ${{ steps.version.outputs.skip }}
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       previous: ${{ steps.version.outputs.previous }}
@@ -119,7 +136,7 @@ jobs:
       publish: ${{ steps.version.outputs.publish }}
     steps:
       - name: Require main
-        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && !inputs.preview
         run: |
           echo "::error::Start releases from main, not ${GITHUB_REF_NAME}."
           exit 1
@@ -137,6 +154,8 @@ jobs:
           BUMP: ${{ inputs.bump }}
           CANDIDATE: ${{ inputs.candidate }}
           DRY_RUN: ${{ inputs.dry_run }}
+          PREVIEW: ${{ inputs.preview }}
+          REVISION: ${{ inputs.revision }}
           GH_TOKEN: ${{ github.token }}
         run: |
           fail() {
@@ -144,11 +163,93 @@ jobs:
             exit 1
           }
 
+          if [ "$PREVIEW" = true ]; then
+            # Callers run previews from workflow_run. Anywhere else (a test
+            # in a pull request) it publishes nothing.
+            if [ "$EVENT" != workflow_run ]; then DRY_RUN=true; fi
+            [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || fail "revision must be a full commit SHA, not '$REVISION'."
+            git cat-file -e "$REVISION^{commit}" 2> /dev/null || fail "The commit $REVISION is not in the repository."
+            git merge-base --is-ancestor "$REVISION" origin/main || fail "The commit $REVISION is not on main."
+            passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$CI_WORKFLOW/runs?head_sha=$REVISION&status=success" --jq .total_count)
+            [ "$passed" != 0 ] || fail "CI has not passed for $REVISION."
+
+            # The newest commit on main that passed CI, which may be newer than
+            # the one that started this run: a run that callers queue behind
+            # another may replace a newer pending run, and the newest commit
+            # must not wait for the next push.
+            for commit in $(git rev-list --first-parent "$REVISION..origin/main"); do
+              newer=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$CI_WORKFLOW/runs?head_sha=$commit&status=success&branch=main&event=push" --jq .total_count)
+              if [ "$newer" != 0 ]; then
+                echo "Publishing $commit, the newest commit on main that passed CI, instead of $REVISION."
+                REVISION=$commit
+                break
+              fi
+            done
+
+            # The newest release that the commit contains, raised by a patch:
+            # 0.2.1-preview.3 is 3 commits past 0.2.0 and sorts before any
+            # later release (0.2.1 or 0.3.0).
+            previous=$(git tag --merged "$REVISION" --list 'v[0-9]*' --sort=-version:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found = 1 }')
+            if [ -n "$previous" ]; then
+              count=$(git rev-list --count "$previous..$REVISION")
+            else
+              count=$(git rev-list --count "$REVISION")
+            fi
+            if [ "$count" = 0 ]; then
+              echo "The commit $REVISION is the release $previous; its image is published already." | tee -a "$GITHUB_STEP_SUMMARY"
+              {
+                echo "publish=false"
+                echo "preview=true"
+                echo "skip=true"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            current=${previous#v}
+            IFS=. read -r major minor patch <<< "${current:-0.0.0}"
+            version="$major.$minor.$((patch + 1))-preview.$count"
+
+            # A re-run of the same commit publishes nothing again: preview
+            # tags never move.
+            if docker buildx imagetools inspect "$IMAGE:$version" > /dev/null 2>&1; then
+              echo "$IMAGE:$version exists already." | tee -a "$GITHUB_STEP_SUMMARY"
+              {
+                echo "publish=false"
+                echo "preview=true"
+                echo "skip=true"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            publish=true
+            if [ "$DRY_RUN" = true ]; then publish=false; fi
+            {
+              echo "## Preview $version"
+              echo
+              echo "Commit $REVISION, $count commits past ${previous:-the first commit}."
+              echo
+              echo "- \`$IMAGE:$version\`"
+              echo "- \`$IMAGE:preview\`, when no newer preview has it"
+            } >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "version=$version"
+              echo "tag="
+              echo "previous=$previous"
+              echo "prerelease=true"
+              echo "tags=$IMAGE:$version"
+              echo "ref=$REVISION"
+              echo "revision=$REVISION"
+              echo "publish=$publish"
+              echo "preview=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ "$EVENT" = pull_request ]; then
             {
               echo "version=0.0.0-pr"
               echo "ref=$GITHUB_SHA"
               echo "publish=false"
+              echo "preview=false"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -260,11 +361,14 @@ jobs:
             echo "ref=$ref"
             echo "revision=$(git rev-parse HEAD)"
             echo "publish=$publish"
+            echo "preview=false"
           } >> "$GITHUB_OUTPUT"
 
   image:
     name: Image (${{ matrix.arch }})
     needs: prepare
+    # A preview of a released commit, or one published already.
+    if: needs.prepare.outputs.skip != 'true'
     strategy:
       matrix:
         include:
@@ -281,6 +385,7 @@ jobs:
       ARCH: ${{ matrix.arch }}
       VERSION: ${{ needs.prepare.outputs.version }}
       PUBLISH: ${{ needs.prepare.outputs.publish }}
+      PREVIEW: ${{ needs.prepare.outputs.preview }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -304,10 +409,10 @@ jobs:
           if [ -n "$TARGET" ]; then
             args+=(--target "$TARGET")
           fi
-          # Only releases upload source maps. The build reads the token as a
-          # secret, so it stays out of the image and the build arguments; the
-          # Dockerfile uploads when the secret is there.
-          if [ "$PUBLISH" = true ] && [ -n "$SENTRY_PROJECT" ]; then
+          # Only releases upload source maps, not previews. The build reads
+          # the token as a secret, so it stays out of the image and the build
+          # arguments; the Dockerfile uploads when the secret is there.
+          if [ "$PUBLISH" = true ] && [ "$PREVIEW" != true ] && [ -n "$SENTRY_PROJECT" ]; then
             if [ -n "$SENTRY_AUTH_TOKEN" ]; then
               args+=(--secret "id=sentry_auth_token,env=SENTRY_AUTH_TOKEN"
                 --build-arg "SENTRY_ORG=$SENTRY_ORG" --build-arg "SENTRY_PROJECT=$SENTRY_PROJECT")
@@ -373,6 +478,7 @@ jobs:
       PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
       TAGS: ${{ needs.prepare.outputs.tags }}
       REVISION: ${{ needs.prepare.outputs.revision }}
+      PREVIEW: ${{ needs.prepare.outputs.preview }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -388,12 +494,46 @@ jobs:
           echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           args=()
           for tag in $TAGS; do args+=(--tag "$tag"); done
+          if [ "$PREVIEW" = true ]; then
+            # The tag preview moves only forward, and only when its state is
+            # known: read it (--raw: the tag itself, nothing it points to),
+            # or confirm that it does not exist yet. Otherwise publish nothing.
+            move="" current=""
+            for attempt in 1 2 3; do
+              if raw=$(docker buildx imagetools inspect --raw "$IMAGE:preview" 2> "$RUNNER_TEMP/inspect.log"); then
+                current=$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$raw")
+                # X.Y.Z-preview.N as X.Y.Z.N, which sort -V orders.
+                newest=$(printf '%s\n%s\n' "${current/-preview./.}" "${VERSION/-preview./.}" | sed '/^$/d' | sort -V | tail -n 1)
+                if [ -z "$current" ] || { [ "$newest" = "${VERSION/-preview./.}" ] && [ "$current" != "$VERSION" ]; }; then
+                  move=true
+                else
+                  move=false
+                  echo "The tag preview stays at $current, which is newer."
+                fi
+                break
+              fi
+              if grep -qiE 'not found|manifest unknown' "$RUNNER_TEMP/inspect.log"; then
+                move=true # the first preview
+                break
+              fi
+              cat "$RUNNER_TEMP/inspect.log"
+              sleep $((attempt * 10))
+            done
+            if [ -z "$move" ]; then
+              echo "::error::Could not read the tag preview; nothing is published. Re-run the job."
+              exit 1
+            fi
+            if [ "$move" = true ]; then
+              args+=(--tag "$IMAGE:preview")
+            fi
+          fi
           annotations=(
             "org.opencontainers.image.title=$TITLE"
             "org.opencontainers.image.description=$DESCRIPTION"
             "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
             "org.opencontainers.image.version=$VERSION"
             "org.opencontainers.image.revision=$REVISION"
+            "org.opencontainers.image.created=$(gh api "repos/$GITHUB_REPOSITORY/commits/$REVISION" --jq .commit.committer.date)"
           )
           if [ -n "$LICENSE" ]; then
             annotations+=("org.opencontainers.image.licenses=$LICENSE")
@@ -413,6 +553,7 @@ jobs:
           push-to-registry: true
 
       - name: Create the GitHub Release
+        if: env.PREVIEW != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.image.outputs.digest }}
@@ -448,7 +589,7 @@ jobs:
       # unreleased work on main. The commit is in the repository already, so
       # the workflow's own token may move the branch. Candidates leave it.
       - name: Move the stable branch to the release
-        if: env.PRERELEASE != 'true'
+        if: env.PRERELEASE != 'true' && env.PREVIEW != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
