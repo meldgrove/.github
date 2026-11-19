@@ -12,8 +12,9 @@
 #            vX.Y.Z-rc.N.
 #   image    builds and starts the image on amd64 and arm64, pushes it by digest
 #   publish  tags both platforms as one image (X.Y.Z, X.Y, X from 1.0.0,
-#            latest), attests its provenance, creates the GitHub Release, and
-#            moves the branch `stable` to the released commit
+#            latest), attests its provenance (public repositories), creates
+#            the GitHub Release, and moves the branch `stable` to the
+#            released commit
 #
 # A dry run does everything except push and publish. Pull requests that change
 # the image build and start both platforms without publishing anything.
@@ -109,6 +110,9 @@ env:
   # The repository of this file. It signs the attestation of every image, so
   # the check of an image's origin names it (--signer-repo).
   SIGNER_REPO: meldgrove/.github
+  # GitHub attests images of private repositories only on Enterprise Cloud;
+  # on other plans a private repository's images go without attestation.
+  ATTEST: ${{ github.event.repository.private != true }}
 
 defaults:
   run:
@@ -547,6 +551,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: env.ATTEST == 'true'
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.image.outputs.digest }}
@@ -568,10 +573,14 @@ jobs:
           fi
           notes=$(gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" "${notes_from[@]}" --jq .body)
           repo_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          upgrade="Upgrade: [${UPGRADE_DOC%%#*}]($repo_url/blob/$TAG/$UPGRADE_DOC)."
+          if [ "$ATTEST" = true ]; then
+            upgrade+=" Check where the image was built: \`gh attestation verify oci://$IMAGE:$VERSION --repo $GITHUB_REPOSITORY --signer-repo $SIGNER_REPO\`"
+          fi
           body=$(printf '%s\n' \
             "Image: \`$IMAGE:$VERSION\` for linux/amd64 and linux/arm64 (\`$DIGEST\`)" \
             "" \
-            "Upgrade: [${UPGRADE_DOC%%#*}]($repo_url/blob/$TAG/$UPGRADE_DOC). Check where the image was built: \`gh attestation verify oci://$IMAGE:$VERSION --repo $GITHUB_REPOSITORY --signer-repo $SIGNER_REPO\`" \
+            "$upgrade" \
             "" \
             "$notes")
           latest=true
@@ -610,6 +619,7 @@ jobs:
           esac
 
       - name: The check of the image's origin from the release notes passes
+        if: env.ATTEST == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh attestation verify "oci://$IMAGE:$VERSION" --repo "$GITHUB_REPOSITORY" --signer-repo "$SIGNER_REPO"
