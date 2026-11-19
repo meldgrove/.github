@@ -187,16 +187,16 @@ jobs:
 
 ### Checking an image
 
-The workflow in this repository signs the attestation of every image, so the
-check names it:
+The workflow in this repository signs the attestation of every image of a
+public repository, so the check names it:
 
 ```sh
 gh attestation verify oci://ghcr.io/meldgrove/<project>:X.Y.Z \
   --repo meldgrove/<project> --signer-repo meldgrove/.github
 ```
 
-Each release runs this check itself after publishing. Images of a private
-repository get no attestation: GitHub offers attestations for private
+Each release of a public repository runs this check itself after
+publishing. Images of a private repository get no attestation: GitHub offers attestations for private
 repositories only on Enterprise Cloud, so the workflow skips both steps there
 and the release notes leave out the check.
 
