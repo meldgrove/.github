@@ -114,6 +114,7 @@ jobs:
 | `ci_workflow` | File name of the workflow that must have passed for the commit. Default `ci.yml`. |
 | `license` | SPDX identifier of the license. Empty while the repository has none. |
 | `sentry_org`, `sentry_project` | Sentry project that releases upload their source maps to. Empty uploads nothing. |
+| `preview`, `revision` | Publish the commit `revision` on `main` as a preview (see [Previews](#previews)). |
 
 With `sentry_project`, a release passes the caller's secret `SENTRY_AUTH_TOKEN`
 (`secrets: SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}` in the calling
@@ -125,6 +126,59 @@ nothing. A release without the secret warns and uploads nothing.
 The repository also needs `.github/release.yml` (sections of the release
 notes), the label `breaking`, a Dockerfile whose runtime stage takes
 `ARG APP_VERSION`, and immutable releases switched on.
+
+### Previews
+
+A preview publishes each commit on `main` once CI passed for it, for
+installations on the Preview channel of the
+[Meldgrove Updater](https://github.com/meldgrove/updater). Its version is the
+next patch after the newest release that the commit contains, plus the
+number of commits since that release: `0.2.1-preview.3` is three commits
+past 0.2.0, and sorts before 0.2.1 and 0.3.0. The image gets that tag and
+`preview`, which moves only to newer previews. A preview creates no git tag
+and no GitHub Release, leaves `stable` alone, and uploads no source maps.
+A released commit, or one published already, publishes nothing.
+
+`.github/workflows/preview.yml` of a repository, with the same values as its
+release caller (`name` in `workflows:` is the `name:` of its CI workflow):
+
+```yaml
+name: Preview
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    # Pushes to main only; CI also runs for pull requests.
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    permissions:
+      actions: read # find the CI run of the commit
+      contents: write # requested by the shared jobs; a preview pushes nothing
+      pull-requests: read
+      packages: write # push the image
+      id-token: write # sign the attestation
+      attestations: write
+      artifact-metadata: write
+    uses: meldgrove/.github/.github/workflows/release.yml@<commit SHA> # v1.1.0
+    with:
+      preview: true
+      revision: ${{ github.event.workflow_run.head_sha }}
+      image: ghcr.io/meldgrove/example
+      upgrade_doc: docs/deployment.md
+      title: Meldgrove Example
+      description: One sentence about the project.
+```
 
 ### Checking an image
 
