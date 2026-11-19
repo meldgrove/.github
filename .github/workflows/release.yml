@@ -177,8 +177,8 @@ jobs:
             # the one that started this run: a run that callers queue behind
             # another may replace a newer pending run, and the newest commit
             # must not wait for the next push.
-            for commit in $(git rev-list --first-parent --max-count=20 "$REVISION..origin/main"); do
-              newer=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$CI_WORKFLOW/runs?head_sha=$commit&status=success" --jq .total_count)
+            for commit in $(git rev-list --first-parent "$REVISION..origin/main"); do
+              newer=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$CI_WORKFLOW/runs?head_sha=$commit&status=success&branch=main&event=push" --jq .total_count)
               if [ "$newer" != 0 ]; then
                 echo "Publishing $commit, the newest commit on main that passed CI, instead of $REVISION."
                 REVISION=$commit
@@ -494,24 +494,34 @@ jobs:
           echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           args=()
           for tag in $TAGS; do args+=(--tag "$tag"); done
-          # The tag preview moves only forward: the CI run of an older commit
-          # that ends after a newer one leaves it where it is.
           if [ "$PREVIEW" = true ]; then
-            move=false
-            if manifest=$(docker buildx imagetools inspect "$IMAGE:preview" --format '{{json .Manifest}}' 2> "$RUNNER_TEMP/inspect.log"); then
-              current=$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$manifest")
-              # X.Y.Z-preview.N as X.Y.Z.N, which sort -V orders.
-              newest=$(printf '%s\n%s\n' "${current/-preview./.}" "${VERSION/-preview./.}" | sed '/^$/d' | sort -V | tail -n 1)
-              if [ -z "$current" ] || { [ "$newest" = "${VERSION/-preview./.}" ] && [ "$current" != "$VERSION" ]; }; then
-                move=true
-              else
-                echo "The tag preview stays at $current, which is newer."
+            # The tag preview moves only forward, and only when its state is
+            # known: read it (--raw: the tag itself, nothing it points to),
+            # or confirm that it does not exist yet. Otherwise publish nothing.
+            move="" current=""
+            for attempt in 1 2 3; do
+              if raw=$(docker buildx imagetools inspect --raw "$IMAGE:preview" 2> "$RUNNER_TEMP/inspect.log"); then
+                current=$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$raw")
+                # X.Y.Z-preview.N as X.Y.Z.N, which sort -V orders.
+                newest=$(printf '%s\n%s\n' "${current/-preview./.}" "${VERSION/-preview./.}" | sed '/^$/d' | sort -V | tail -n 1)
+                if [ -z "$current" ] || { [ "$newest" = "${VERSION/-preview./.}" ] && [ "$current" != "$VERSION" ]; }; then
+                  move=true
+                else
+                  move=false
+                  echo "The tag preview stays at $current, which is newer."
+                fi
+                break
               fi
-            elif grep -qiE 'not found|manifest unknown' "$RUNNER_TEMP/inspect.log"; then
-              move=true # the first preview
-            else
+              if grep -qiE 'not found|manifest unknown' "$RUNNER_TEMP/inspect.log"; then
+                move=true # the first preview
+                break
+              fi
               cat "$RUNNER_TEMP/inspect.log"
-              echo "::warning::Could not read the tag preview, so it stays where it is."
+              sleep $((attempt * 10))
+            done
+            if [ -z "$move" ]; then
+              echo "::error::Could not read the tag preview; nothing is published. Re-run the job."
+              exit 1
             fi
             if [ "$move" = true ]; then
               args+=(--tag "$IMAGE:preview")
