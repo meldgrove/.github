@@ -139,6 +139,10 @@ past 0.2.0, and sorts before 0.2.1 and 0.3.0. The image gets that tag and
 and no GitHub Release, leaves `stable` alone, and uploads no source maps.
 A released commit, or one published already, publishes nothing.
 
+A preview publishes the newest commit on `main` that passed CI, so a run
+that ends late or replaces a pending one never leaves the newest commit
+out. Callers run one preview at a time (`concurrency` below).
+
 `.github/workflows/preview.yml` of a repository, with the same values as its
 release caller (`name` in `workflows:` is the `name:` of its CI workflow):
 

@@ -136,7 +136,7 @@ jobs:
       publish: ${{ steps.version.outputs.publish }}
     steps:
       - name: Require main
-        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && !inputs.preview
         run: |
           echo "::error::Start releases from main, not ${GITHUB_REF_NAME}."
           exit 1
@@ -173,10 +173,23 @@ jobs:
             passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$CI_WORKFLOW/runs?head_sha=$REVISION&status=success" --jq .total_count)
             [ "$passed" != 0 ] || fail "CI has not passed for $REVISION."
 
+            # The newest commit on main that passed CI, which may be newer than
+            # the one that started this run: a run that callers queue behind
+            # another may replace a newer pending run, and the newest commit
+            # must not wait for the next push.
+            for commit in $(git rev-list --first-parent --max-count=20 "$REVISION..origin/main"); do
+              newer=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$CI_WORKFLOW/runs?head_sha=$commit&status=success" --jq .total_count)
+              if [ "$newer" != 0 ]; then
+                echo "Publishing $commit, the newest commit on main that passed CI, instead of $REVISION."
+                REVISION=$commit
+                break
+              fi
+            done
+
             # The newest release that the commit contains, raised by a patch:
             # 0.2.1-preview.3 is 3 commits past 0.2.0 and sorts before any
             # later release (0.2.1 or 0.3.0).
-            previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude 'v*-*' "$REVISION" 2> /dev/null || true)
+            previous=$(git tag --merged "$REVISION" --list 'v[0-9]*' --sort=-version:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')
             if [ -n "$previous" ]; then
               count=$(git rev-list --count "$previous..$REVISION")
             else
@@ -484,14 +497,24 @@ jobs:
           # The tag preview moves only forward: the CI run of an older commit
           # that ends after a newer one leaves it where it is.
           if [ "$PREVIEW" = true ]; then
-            current=$(docker buildx imagetools inspect "$IMAGE:preview" --format '{{json .Manifest}}' 2> /dev/null |
-              jq -r '.annotations["org.opencontainers.image.version"] // empty' || true)
-            # X.Y.Z-preview.N as X.Y.Z.N, which sort -V orders.
-            newest=$(printf '%s\n%s\n' "${current/-preview./.}" "${VERSION/-preview./.}" | sed '/^$/d' | sort -V | tail -n 1)
-            if [ -z "$current" ] || { [ "$newest" = "${VERSION/-preview./.}" ] && [ "$current" != "$VERSION" ]; }; then
-              args+=(--tag "$IMAGE:preview")
+            move=false
+            if manifest=$(docker buildx imagetools inspect "$IMAGE:preview" --format '{{json .Manifest}}' 2> "$RUNNER_TEMP/inspect.log"); then
+              current=$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$manifest")
+              # X.Y.Z-preview.N as X.Y.Z.N, which sort -V orders.
+              newest=$(printf '%s\n%s\n' "${current/-preview./.}" "${VERSION/-preview./.}" | sed '/^$/d' | sort -V | tail -n 1)
+              if [ -z "$current" ] || { [ "$newest" = "${VERSION/-preview./.}" ] && [ "$current" != "$VERSION" ]; }; then
+                move=true
+              else
+                echo "The tag preview stays at $current, which is newer."
+              fi
+            elif grep -qiE 'not found|manifest unknown' "$RUNNER_TEMP/inspect.log"; then
+              move=true # the first preview
             else
-              echo "The tag preview stays at $current, which is newer."
+              cat "$RUNNER_TEMP/inspect.log"
+              echo "::warning::Could not read the tag preview, so it stays where it is."
+            fi
+            if [ "$move" = true ]; then
+              args+=(--tag "$IMAGE:preview")
             fi
           fi
           annotations=(
