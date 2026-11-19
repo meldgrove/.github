@@ -141,7 +141,7 @@ A released commit, or one published already, publishes nothing.
 
 A preview publishes the newest commit on `main` that passed CI, so a run
 that ends late or replaces a pending one never leaves the newest commit
-out. Callers run one preview at a time (`concurrency` below).
+out. Callers run one preview at a time (`concurrency` on the job below).
 
 `.github/workflows/preview.yml` of a repository, with the same values as its
 release caller (`name` in `workflows:` is the `name:` of its CI workflow):
@@ -158,14 +158,15 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: preview
-  cancel-in-progress: false
-
 jobs:
   preview:
     # Pushes to main only; CI also runs for pull requests.
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    # One preview at a time. On the job, not the workflow: a failed CI run,
+    # which skips the job, must not replace a waiting preview.
+    concurrency:
+      group: preview
+      cancel-in-progress: false
     permissions:
       actions: read # find the CI run of the commit
       contents: write # requested by the shared jobs; a preview pushes nothing
