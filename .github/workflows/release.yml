@@ -264,7 +264,13 @@ jobs:
             exit 0
           fi
 
-          passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$CI_WORKFLOW/runs?head_sha=$GITHUB_SHA&status=success" --jq .total_count)
+          # Right after CI ends, the list of runs may not show it as passed
+          # yet: ask again for a minute, as for a preview.
+          for attempt in 1 2 3 4 5 6; do
+            passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$CI_WORKFLOW/runs?head_sha=$GITHUB_SHA&status=success" --jq .total_count)
+            if [ "$passed" != 0 ] || [ "$attempt" = 6 ]; then break; fi
+            sleep 10
+          done
           [ "$passed" != 0 ] || fail "CI has not passed for $GITHUB_SHA. Wait for CI on main to finish, then start the release again."
 
           # The tags hold the version: the newest release without a suffix,
