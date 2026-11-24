@@ -179,7 +179,7 @@ jobs:
                     elif .State == "exited" and .ExitCode == 0 then empty
                     elif .State == "exited" then "ended with exit code \(.ExitCode)"
                     elif .State == "created" then "never started"
-                    elif .State == "restarting" then "keeps restarting (exit code \(.ExitCode))"
+                    elif .State == "restarting" then "keeps restarting"
                     elif .Health == "starting" then "did not become healthy in time"
                     elif .Health == "unhealthy" then "is unhealthy"
                     else "is \(.State)"
