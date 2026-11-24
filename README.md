@@ -4,6 +4,9 @@ Files that every [Meldgrove](https://github.com/meldgrove) repository uses:
 
 - [`.github/workflows/release.yml`](.github/workflows/release.yml): the release
   workflow. Each repository calls it from a short workflow of its own.
+- [`.github/workflows/compose-compat.yml`](.github/workflows/compose-compat.yml):
+  the check that a new image still starts with the compose files of the
+  newest release. Each repository calls it from its CI.
 - [`SECURITY.md`](SECURITY.md): the security policy of repositories that have
   none of their own.
 
@@ -200,15 +203,76 @@ publishing. Images of a private repository get no attestation: GitHub offers att
 repositories only on Enterprise Cloud, so the workflow skips both steps there
 and the release notes leave out the check.
 
-### Changing the workflow
+## Compose compatibility
+
+The [Meldgrove Updater](https://github.com/meldgrove/updater) installs images,
+not files. On a server, `compose.yaml` and `compose.postgres.yaml` stay at the
+release that the operator last pulled from the branch `stable`. So every new
+image must still start with the compose files of the newest release: their
+commands, health checks and settings. A project's CI checks this with
+[`.github/workflows/compose-compat.yml`](.github/workflows/compose-compat.yml).
+The job:
+
+1. finds the branch `stable`. Without it (no release yet), the job passes
+   with a notice;
+2. writes `.env` next to the compose files of `stable`: the project's env
+   file, the version variable set to `0.0.0-compat`, and `COMPOSE_FILE` with
+   the compose files and the extra compose files;
+3. builds the commit's image (the last stage of its Dockerfile) under the
+   name that these compose files give the app's image, e.g.
+   `ghcr.io/meldgrove/example:0.0.0-compat`;
+4. runs `docker compose up --detach --wait`, as the updater's deploy script
+   does on a server, for 5 minutes at most;
+5. fails when a service does not become healthy or a one-off service, such
+   as `migrate`, ends with an error. The summary names the services; the log
+   shows their last health check and their logs, then the other services'
+   logs (folded);
+6. removes the containers and volumes, whatever happened.
+
+In the CI workflow of a project:
+
+```yaml
+jobs:
+  compose-compat:
+    name: Compose files of the newest release
+    permissions:
+      contents: read
+    uses: meldgrove/.github/.github/workflows/compose-compat.yml@<commit SHA> # v1.2.0
+    with:
+      version_variable: EXAMPLE_VERSION
+      env_file: .github/compose-compat.env
+```
+
+| Input | Meaning |
+| --- | --- |
+| `version_variable` | The variable in `.env` that holds the app's image version, e.g. `HANDBOOK_VERSION`. |
+| `env_file` | A file in the repository with fake but valid settings for `.env`. |
+| `compose_files` | Compose files of the newest release, from `stable`. Default `compose.yaml compose.postgres.yaml`. |
+| `extra_compose_files` | Compose files of the tested commit, added after `compose_files`. Default: none. |
+
+The env file holds what a server of the newest release has in its `.env`:
+every variable that its compose files require (`${NAME:?…}`), with values the
+app accepts, such as a `DATABASE_URL` that reaches the `postgres` service of
+`compose.postgres.yaml` with `POSTGRES_PASSWORD`. A setting that the tested
+commit adds belongs there only once a release asks operators for it;
+otherwise the job would pass where servers fail. The file is public: fake
+values only, such as `example.invalid` addresses.
+
+The sign-in provider and other services on the internet need not exist, as
+long as the app becomes healthy without them. Otherwise an extra compose file
+gives the service a stand-in. It may run the image under test, e.g.
+`image: ghcr.io/meldgrove/example:${EXAMPLE_VERSION}`, so that it needs no
+other image.
+
+## Changing a workflow
 
 1. Open a pull request here.
 2. Test it from a project: in a branch there, point `uses:` at the commit of
-   the pull request and open a pull request. It builds and starts both images
-   with the changed workflow, without publishing.
+   the pull request and open a pull request. The release workflow builds and
+   starts both images without publishing; the compose check runs as in CI.
 3. After merging, tag the merge commit (`vX.Y.Z`; a major version when the
    callers must change) and push the tag. Dependabot then proposes the new
    commit to every project.
 
-Projects pin the workflow by commit SHA, so a change here reaches a project
+Projects pin the workflows by commit SHA, so a change here reaches a project
 only with such an update.

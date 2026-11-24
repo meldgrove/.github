@@ -1,0 +1,239 @@
+# A new image must still start with the compose files of the newest release.
+# The Meldgrove Updater installs images, not files: on a server, compose.yaml
+# and compose.postgres.yaml stay at the release that the operator last pulled
+# from the branch `stable`. Each repository calls this workflow from its CI;
+# README.md shows such a caller.
+#
+# The job builds the caller's commit as the app's image with the version
+# 0.0.0-compat, takes the compose files of the branch `stable`, writes a .env
+# from the caller's env file (fake but valid settings), and starts everything
+# with `docker compose up --wait`, as the updater's deploy script does on a
+# server. It fails, with every service's logs, when a service does not become
+# healthy or a one-off service such as migrate fails. Without a branch
+# `stable` (no release yet) it passes with a notice. It always removes what
+# it started, volumes included.
+#
+# Only GitHub-owned actions pinned by commit SHA (repository Actions settings):
+# Docker runs through its command line.
+
+name: Compose compatibility
+
+on:
+  workflow_call:
+    inputs:
+      version_variable:
+        description: The variable in .env that holds the app's image version, e.g. HANDBOOK_VERSION
+        type: string
+        required: true
+      env_file:
+        description: Path of a file in the repository with fake but valid settings for .env, e.g. .github/compose-compat.env
+        type: string
+        required: true
+      compose_files:
+        description: Compose files of the newest release (branch stable), separated by spaces
+        type: string
+        default: compose.yaml compose.postgres.yaml
+      extra_compose_files:
+        description: Compose files of the tested commit, added after compose_files (stand-ins for services that need the internet), separated by spaces
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compat:
+    name: Starts with the compose files of the newest release
+    # Reimbursements' document sandbox needs the Landlock ABI 3 of this kernel.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VERSION_VARIABLE: ${{ inputs.version_variable }}
+      ENV_FILE: ${{ inputs.env_file }}
+      COMPOSE_FILES: ${{ inputs.compose_files }}
+      EXTRA_COMPOSE_FILES: ${{ inputs.extra_compose_files }}
+      # The version of the image under test. It sorts before every release.
+      VERSION: 0.0.0-compat
+      PROJECT: compat-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Find the newest release
+        id: stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if sha=$(gh api "repos/$GITHUB_REPOSITORY/branches/stable" --jq .commit.sha 2> "$RUNNER_TEMP/stable.log"); then
+            echo "The branch stable, the newest release, is at $sha."
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/stable.log"; then
+            echo "::notice::No branch stable yet: there is no release whose compose files a new image must start with."
+            echo "No branch stable yet: nothing to check before the first release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$RUNNER_TEMP/stable.log"
+            echo "::error::Could not read the branch stable."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.stable.outputs.sha
+        with:
+          path: app
+          persist-credentials: false
+
+      # The app's folder on a server: a clone of stable.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.stable.outputs.sha
+        with:
+          ref: ${{ steps.stable.outputs.sha }}
+          path: server
+          persist-credentials: false
+
+      - name: Write .env
+        if: steps.stable.outputs.sha
+        working-directory: server
+        run: |
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          [[ "$VERSION_VARIABLE" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "version_variable must be a variable name, not '$VERSION_VARIABLE'."
+          inside() { [[ "$1" != /* && "/$1/" != */../* ]]; }
+          inside "$ENV_FILE" && [ -f "../app/$ENV_FILE" ] || fail "env_file: $ENV_FILE is not a file in the repository."
+
+          files=()
+          for file in $COMPOSE_FILES; do
+            inside "$file" && [ -f "$file" ] || fail "The newest release has no $file (branch stable)."
+            files+=("$file")
+          done
+          [ "${#files[@]}" != 0 ] || fail "compose_files names no file."
+          # The caller's stand-ins, at the same path in the app's folder.
+          for file in $EXTRA_COMPOSE_FILES; do
+            inside "$file" && [ -f "../app/$file" ] || fail "extra_compose_files: $file is not a file in the repository."
+            mkdir -p "$(dirname "$file")"
+            cp "../app/$file" "$file"
+            files+=("$file")
+          done
+
+          # The caller's settings, then the version under test and the files.
+          {
+            grep -vE "^[[:space:]]*(export[[:space:]]+)?($VERSION_VARIABLE|COMPOSE_FILE)[[:space:]]*=" "../app/$ENV_FILE" || true
+            echo
+            echo "$VERSION_VARIABLE=$VERSION"
+            echo "COMPOSE_FILE=$(IFS=:; echo "${files[*]}")"
+          } > .env
+          echo "COMPOSE_FILE=$(IFS=:; echo "${files[*]}")"
+
+          # The compose files name the image under test through the version
+          # variable, e.g. ghcr.io/meldgrove/handbook:${HANDBOOK_VERSION}.
+          images=$(docker compose --ansi never --project-name "$PROJECT" config --images) ||
+            fail "docker compose config failed with the newest release's compose files: $ENV_FILE may lack a setting that they require (see above)."
+          while read -r image; do
+            if [[ "$image" == *":$VERSION" ]]; then echo "$image"; fi
+          done <<< "$images" | sort -u > "$RUNNER_TEMP/images"
+          [ -s "$RUNNER_TEMP/images" ] || fail "No service of the newest release's compose files runs the image that $VERSION_VARIABLE selects."
+          echo "Image under test: $(paste -sd ' ' "$RUNNER_TEMP/images")"
+
+      - name: Build the image
+        if: steps.stable.outputs.sha
+        working-directory: app
+        run: |
+          tags=()
+          while read -r image; do tags+=(--tag "$image"); done < "$RUNNER_TEMP/images"
+          docker build --build-arg "APP_VERSION=$VERSION" "${tags[@]}" .
+
+      - name: Start it with the compose files of the newest release
+        if: steps.stable.outputs.sha
+        working-directory: server
+        env:
+          STABLE: ${{ steps.stable.outputs.sha }}
+        run: |
+          compose() { docker compose --ansi never --project-name "$PROJECT" "$@"; }
+          services=$(compose config --services | sort)
+          echo "Services: $(paste -sd ' ' <<< "$services")"
+
+          # What the updater's deploy script runs on a server.
+          started=true
+          compose up --detach --wait --wait-timeout 300 --quiet-pull || started=false
+          echo
+          compose ps --all --format 'table {{.Service}}\t{{.State}}\t{{.Status}}'
+
+          # Every service runs, healthy where it has a health check, or ended
+          # with exit code 0 (one-off services such as migrate).
+          compose ps --all --format json | jq -s flatten > "$RUNNER_TEMP/containers.json"
+          failing=() problems=()
+          for service in $services; do
+            problem=$(jq -r --arg service "$service" '
+              [.[] | select(.Service == $service)] as $containers
+              | if ($containers | length) == 0 then "has no container"
+                else [$containers[]
+                  | if .State == "running" and ((.Health // "") == "" or .Health == "healthy") then empty
+                    elif .State == "exited" and .ExitCode == 0 then empty
+                    elif .State == "exited" then "ended with exit code \(.ExitCode)"
+                    elif .State == "created" then "never started"
+                    elif .Health == "starting" then "did not become healthy in time"
+                    elif .Health == "unhealthy" then "is unhealthy"
+                    else "is \(.State)"
+                    end] | first // empty
+                end' "$RUNNER_TEMP/containers.json")
+            if [ -n "$problem" ]; then
+              failing+=("$service")
+              problems+=("$service $problem")
+            fi
+          done
+
+          if [ "$started" = true ] && [ "${#failing[@]}" = 0 ]; then
+            echo "The new image started with the compose files of the newest release (stable at $STABLE)." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "## The new image fails with the compose files of the newest release"
+            echo
+            echo "Branch stable at \`$STABLE\`, \`$(grep '^COMPOSE_FILE=' .env)\`."
+            echo
+            for problem in "${problems[@]}"; do echo "- $problem"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${#problems[@]}" = 0 ]; then
+            echo "::error::docker compose up failed with the compose files of the newest release (see its output above)."
+          fi
+          for problem in "${problems[@]}"; do
+            echo "::error::$problem, with the compose files of the newest release."
+          done
+
+          # The failing services' logs first, then the others' (folded).
+          logs() {
+            output=$(compose logs --no-color --timestamps "$1")
+            echo "${output:-(no output)}"
+          }
+          for service in "${failing[@]}"; do
+            echo
+            echo "──── $service ────"
+            for id in $(compose ps --all --quiet "$service"); do
+              checks=$(docker inspect --format '{{if .State.Health}}{{json .State.Health.Log}}{{end}}' "$id")
+              if [ -n "$checks" ] && [ "$checks" != null ]; then
+                jq -r 'last // empty | "Last health check: exit code \(.ExitCode), output: \(.Output)"' <<< "$checks"
+              fi
+            done
+            logs "$service"
+          done
+          for service in $services; do
+            if [[ " ${failing[*]} " != *" $service "* ]]; then
+              echo "::group::Logs of $service"
+              logs "$service"
+              echo "::endgroup::"
+            fi
+          done
+          exit 1
+
+      - name: Remove the containers and volumes
+        if: always() && steps.stable.outputs.sha
+        working-directory: server
+        run: |
+          if [ -f .env ]; then
+            docker compose --ansi never --project-name "$PROJECT" down --volumes --remove-orphans --timeout 10
+          fi
