@@ -51,8 +51,6 @@ jobs:
     # Reimbursements' document sandbox needs the Landlock ABI 3 of this kernel.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: read
     env:
       VERSION_VARIABLE: ${{ inputs.version_variable }}
       ENV_FILE: ${{ inputs.env_file }}
@@ -112,8 +110,12 @@ jobs:
           done
           [ "${#files[@]}" != 0 ] || fail "compose_files names no file."
           # The caller's stand-ins, at the same path in the app's folder.
+          released=("${files[@]}")
           for file in $EXTRA_COMPOSE_FILES; do
             inside "$file" && [ -f "../app/$file" ] || fail "extra_compose_files: $file is not a file in the repository."
+            for other in "${released[@]}"; do
+              [ ! "$file" -ef "$other" ] || fail "extra_compose_files: $file must come from the newest release (compose_files)."
+            done
             mkdir -p "$(dirname "$file")"
             cp "../app/$file" "$file"
             files+=("$file")
@@ -156,9 +158,11 @@ jobs:
           services=$(compose config --services | sort)
           echo "Services: $(paste -sd ' ' <<< "$services")"
 
-          # What the updater's deploy script runs on a server.
+          # What the updater's deploy script runs on a server. --pull missing:
+          # the image under test is never pulled, even where a compose file
+          # sets pull_policy: always (Connector's PULL_POLICY).
           started=true
-          compose up --detach --wait --wait-timeout 300 --quiet-pull || started=false
+          compose up --detach --wait --wait-timeout 300 --quiet-pull --pull missing || started=false
           echo
           compose ps --all --format 'table {{.Service}}\t{{.State}}\t{{.Status}}'
 
@@ -175,6 +179,7 @@ jobs:
                     elif .State == "exited" and .ExitCode == 0 then empty
                     elif .State == "exited" then "ended with exit code \(.ExitCode)"
                     elif .State == "created" then "never started"
+                    elif .State == "restarting" then "keeps restarting (exit code \(.ExitCode))"
                     elif .Health == "starting" then "did not become healthy in time"
                     elif .Health == "unhealthy" then "is unhealthy"
                     else "is \(.State)"
