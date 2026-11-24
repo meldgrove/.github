@@ -569,6 +569,14 @@ jobs:
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
 
+      # The updaters in the field check this signature before they install
+      # the image (updater 0.2.5 and later). An image they cannot verify,
+      # for example after actions/attest changes its bundle format, would
+      # never install: fail here instead, before the GitHub Release.
+      - name: Installed updaters accept the image's signature
+        if: env.ATTEST == 'true'
+        run: docker run --rm --pull always ghcr.io/meldgrove/updater:0.2 verify-image "$IMAGE:$VERSION" --repo "$GITHUB_REPOSITORY"
+
       - name: Create the GitHub Release
         if: env.PREVIEW != 'true'
         env:
