@@ -24,8 +24,9 @@ workflow:
    pushes only the tag. No file holds the version;
 4. builds and starts the image on amd64 and arm64, and publishes it as
    `X.Y.Z`, `X.Y`, from 1.0.0 also `X`, and `latest`;
-5. attests where the image was built and creates the GitHub Release, with
-   notes from the pull request titles;
+5. attests where the image was built, checks that the Meldgrove Updater
+   accepts that signature (`updater verify-image`), and creates the GitHub
+   Release, with notes from the pull request titles;
 6. moves the branch `stable` to the released commit. Platforms that read
    `compose.yaml` from the repository follow `stable`, so that file belongs
    to the newest release and not to unreleased work on `main`.
